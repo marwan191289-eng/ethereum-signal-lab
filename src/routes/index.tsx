@@ -2,7 +2,14 @@ import { createFileRoute } from "@tanstack/react-router";
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { ClientOnly } from "@tanstack/react-router";
 import { useMarketData } from "@/hooks/use-market-data";
-import { applyFilters, backtestFiltered, DEFAULT_FILTERS, type Filters, computeSignal, positionSize, type Direction } from "@/lib/engine";
+import { useHorizonData } from "@/hooks/use-horizon-data";
+import { useOrderBook } from "@/hooks/use-order-book";
+import { HorizonLab } from "@/components/HorizonLab";
+import { PaperLab, type Trade } from "@/components/PaperLab";
+import {
+  applyFilters, backtestFiltered, DEFAULT_FILTERS, NO_FILTERS, type Filters, computeSignal, positionSize, type Direction,
+  type Horizon, HTF_PERIODS, HORIZON_SECONDS, takerBuyRatio, pressureAgrees, walkForward,
+} from "@/lib/engine";
 
 const PriceChart = lazy(() => import("@/components/PriceChart"));
 
@@ -10,9 +17,9 @@ export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
       { title: "ETH Intelligence — إشارات ETH/USDT لحظية" },
-      { name: "description", content: "محرك إشارات وتنبؤات لحظية لـ ETH/USDT بأفق 5 دقائق ببيانات Binance الحية وإدارة مخاطرة 1%." },
+      { name: "description", content: "محرك إشارات ETH/USDT بآفاق 5 و15 دقيقة وساعة، مع ضغط الشراء والبيع من Binance واختبار مستقل بعد الرسوم." },
       { property: "og:title", content: "ETH Intelligence — إشارات ETH/USDT لحظية" },
-      { property: "og:description", content: "إشارات وتنبؤات 5 دقائق ببيانات Binance الحية ومخاطرة 1%." },
+      { property: "og:description", content: "إشارات متعددة الآفاق، ضغط دفتر أوامر Binance، واختبار رجعي مستقل بعد الرسوم." },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
     ],
@@ -22,8 +29,6 @@ export const Route = createFileRoute("/")({
 
 const RISK = 1;
 
-type Trade = { id: number; dir: Direction; entry: number; stop: number; target: number; qty: number; time: number; exit?: number; pnl?: number };
-
 const fmt = (n: number, d = 2) => n.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
 const dirLabel: Record<Direction, string> = { LONG: "شراء", SHORT: "بيع", NEUTRAL: "انتظار" };
 
@@ -32,6 +37,8 @@ function Dashboard() {
   const [alerts, setAlerts] = useState(true);
   const [trades, setTrades] = useState<Trade[]>([]);
   const [history, setHistory] = useState<{ t: number; dir: Direction; conf: number; price: number }[]>([]);
+  const [feePct, setFeePct] = useState(0.1);
+  const [horizon, setHorizon] = useState<Horizon>("5m");
   const lastDir = useRef<Direction>("NEUTRAL");
 
   useEffect(() => {
@@ -39,21 +46,43 @@ function Dashboard() {
       const s = JSON.parse(localStorage.getItem("ethi") || "{}");
       if (s.equity) setEquity(s.equity);
       if (s.trades) setTrades(s.trades);
+      if (s.filters) setFilters({ ...DEFAULT_FILTERS, ...s.filters });
     } catch {}
   }, []);
-  useEffect(() => { localStorage.setItem("ethi", JSON.stringify({ equity, trades })); }, [equity, trades]);
 
   const market = useMarketData();
+  const h15 = useHorizonData("15m");
+  const h1 = useHorizonData("1h");
+  const book = useOrderBook();
   const { candles, stale, status } = market;
   const live = status === "live" && !stale;
   const [perm, setPerm] = useState<NotificationPermission | "unsupported">("default");
   useEffect(() => { setPerm(typeof Notification === "undefined" ? "unsupported" : Notification.permission); }, []);
 
   const [filters, setFilters] = useState<Filters>(DEFAULT_FILTERS);
-  const sig = useMemo(() => (candles.length > 50 ? applyFilters(candles, candles.length - 1, computeSignal(candles), filters) : null), [candles, filters]);
+  useEffect(() => { localStorage.setItem("ethi", JSON.stringify({ equity, trades, filters })); }, [equity, trades, filters]);
+
+  // Horizon candles: 5m from the live stream; 15m/1h from REST with the in-progress candle's close replaced by the live price.
+  const livePrice = candles.length ? candles[candles.length - 1].close : 0;
+  const hc = useMemo(() => {
+    const src = horizon === "5m" ? candles : horizon === "15m" ? h15.candles : h1.candles;
+    if (horizon === "5m" || !src.length || !livePrice) return src;
+    const last = src[src.length - 1];
+    return [...src.slice(0, -1), { ...last, close: livePrice, high: Math.max(last.high, livePrice), low: Math.min(last.low, livePrice) }];
+  }, [horizon, candles, h15.candles, h1.candles, livePrice]);
+
+  const raw = useMemo(() => (hc.length > 50 ? computeSignal(hc) : null), [hc]);
+  const sig = useMemo(() => (raw ? applyFilters(hc, hc.length - 1, raw, filters, { periods: HTF_PERIODS[horizon], book: book.imbalance }) : null), [raw, hc, filters, horizon, book.imbalance]);
+  const taker = hc.length ? takerBuyRatio(hc, hc.length - 1) : null;
+  const pressureOk = raw && raw.direction !== "NEUTRAL" ? pressureAgrees(raw.direction, taker, book.imbalance) : null;
+
   const lastT = candles.length > 0 ? candles[candles.length - 1].time : 0;
-  const bt = useMemo(() => (candles.length > 300 ? backtestFiltered(candles.slice(0, -1), filters, 0.1, 250) : null), [lastT, filters]);
-  const btRaw = useMemo(() => (candles.length > 300 ? backtestFiltered(candles.slice(0, -1), { htfTrend: false, volume: false }, 0.1, 250) : null), [lastT]);
+  const bt = useMemo(() => (candles.length > 300 ? backtestFiltered(candles.slice(0, -1), filters, feePct, 250) : null), [lastT, filters, feePct]);
+  const btRaw = useMemo(() => (candles.length > 300 ? backtestFiltered(candles.slice(0, -1), NO_FILTERS, feePct, 250) : null), [lastT, feePct]);
+  const expectedOOS = useMemo(() => {
+    const c = horizon === "15m" ? h15.candles : horizon === "1h" ? h1.candles : candles;
+    return c.length > 400 ? walkForward(c.slice(0, -1), filters, feePct, horizon).outSample.expectancy : null;
+  }, [horizon, h15.candles, h1.candles, horizon === "5m" ? lastT : 0, filters, feePct]);
   const size = sig ? positionSize(equity, RISK, sig.price, sig.stop) : null;
 
   // Alerts on direction change
@@ -69,41 +98,54 @@ function Dashboard() {
     }
   }, [sig?.direction]);
 
-  // Close paper trades on stop / target
+  const settle = (t: Trade, exit: number, outcome: Trade["outcome"]): Trade => {
+    const gross = (t.dir === "LONG" ? exit - t.entry : t.entry - exit) * t.qty;
+    const fee = (t.entry * t.qty * (t.feePct ?? 0)) / 100;
+    const risk = Math.abs(t.entry - t.stop) * t.qty;
+    const pnl = gross - fee;
+    return { ...t, exit, pnl, fee, r: risk > 0 ? pnl / risk : 0, outcome, closedAt: Date.now() };
+  };
+
+  // Close paper trades on stop / target / horizon expiry (same rule as the backtest).
   useEffect(() => {
-    if (!sig || stale) return;
-    const p = sig.price;
+    if (!livePrice || stale) return;
+    const p = livePrice;
     let realized = 0;
+    let changed = false;
+    const now = Date.now();
     const next = trades.map((t) => {
       if (t.exit !== undefined) return t;
       const hitStop = t.dir === "LONG" ? p <= t.stop : p >= t.stop;
       const hitTarget = t.dir === "LONG" ? p >= t.target : p <= t.target;
-      if (!hitStop && !hitTarget) return t;
-      const exit = hitStop ? t.stop : t.target;
-      const pnl = (t.dir === "LONG" ? exit - t.entry : t.entry - exit) * t.qty;
-      realized += pnl;
-      return { ...t, exit, pnl };
+      const expired = t.expiresAt !== undefined && now >= t.expiresAt;
+      if (!hitStop && !hitTarget && !expired) return t;
+      const done = settle(t, hitStop ? t.stop : hitTarget ? t.target : p, hitStop ? "stop" : hitTarget ? "target" : "timeout");
+      realized += done.pnl!;
+      changed = true;
+      return done;
     });
-    if (realized !== 0) { setTrades(next); setEquity((e) => e + realized); }
-  }, [sig?.price]);
+    if (changed) { setTrades(next); setEquity((e) => e + realized); }
+  }, [livePrice, lastT, Math.floor(Date.now() / 5000)]);
 
   const closeTrade = (id: number) => {
-    if (!sig || stale) return;
-    const p = sig.price;
-    let realized = 0;
-    setTrades((all) => all.map((t) => {
-      if (t.id !== id || t.exit !== undefined) return t;
-      const pnl = (t.dir === "LONG" ? p - t.entry : t.entry - p) * t.qty;
-      realized = pnl;
-      return { ...t, exit: p, pnl };
-    }));
-    setEquity((e) => e + realized);
+    if (!livePrice || stale) return;
+    const t = trades.find((x) => x.id === id);
+    if (!t || t.exit !== undefined) return;
+    const done = settle(t, livePrice, "manual");
+    setTrades((all) => all.map((x) => (x.id === id ? done : x)));
+    setEquity((e) => e + done.pnl!);
   };
 
   const openTrade = () => {
     if (stale || !sig || !size || sig.direction === "NEUTRAL") return;
-    setTrades((t) => [{ id: Date.now(), dir: sig.direction, entry: sig.price, stop: sig.stop, target: sig.target, qty: size.qty, time: Date.now() }, ...t]);
+    const now = Date.now();
+    setTrades((t) => [{
+      id: now, dir: sig.direction, entry: sig.price, stop: sig.stop, target: sig.target, qty: size.qty, time: now,
+      horizon, expiresAt: now + HORIZON_SECONDS[horizon] * 1000, feePct, confidence: sig.confidence,
+      filters: { ...filters }, taker, book: book.imbalance, pressureOk: pressureOk ?? false, expectedR: expectedOOS,
+    }, ...t]);
   };
+  const clearClosed = () => setTrades((t) => t.filter((x) => x.exit === undefined));
 
   const toggleAlerts = async () => {
     if (!alerts && typeof Notification !== "undefined" && Notification.permission === "default") {
@@ -113,8 +155,9 @@ function Dashboard() {
   };
 
   const prevClose = candles.length > 1 ? candles[candles.length - 2].close : 0;
-  const change = sig && prevClose ? ((sig.price - prevClose) / prevClose) * 100 : 0;
+  const change = livePrice && prevClose ? ((livePrice - prevClose) / prevClose) * 100 : 0;
   const tone = (d?: Direction) => (d === "LONG" ? "text-bull" : d === "SHORT" ? "text-bear" : "text-muted-foreground");
+  const horizonLabel: Record<Horizon, string> = { "5m": "5 دقائق", "15m": "15 دقيقة", "1h": "ساعة" };
 
   return (
     <div dir="rtl" className="min-h-screen bg-background text-foreground">
@@ -124,7 +167,7 @@ function Dashboard() {
             <div className="grid h-9 w-9 place-items-center rounded-md bg-primary font-mono text-lg font-bold text-primary-foreground">Ξ</div>
             <div>
               <h1 className="text-lg font-bold leading-none">ETH Intelligence</h1>
-              <p className="mt-1 font-mono text-xs text-muted-foreground">ETH/USDT · 5m · RISK {RISK}%</p>
+              <p className="mt-1 font-mono text-xs text-muted-foreground">ETH/USDT · {horizon} · RISK {RISK}%</p>
             </div>
           </div>
           <div className="flex items-center gap-3 text-sm">
@@ -148,11 +191,11 @@ function Dashboard() {
             <div className="flex flex-wrap items-end justify-between gap-4">
               <div>
                 <p className="text-xs text-muted-foreground">السعر الحالي</p>
-                <p className="font-mono text-4xl font-bold">{sig ? fmt(sig.price) : "—"}</p>
+                <p className="font-mono text-4xl font-bold">{livePrice ? fmt(livePrice) : "—"}</p>
                 <p className={`font-mono text-sm ${change >= 0 ? "text-bull" : "text-bear"}`}>{change >= 0 ? "+" : ""}{change.toFixed(3)}% (شمعة)</p>
               </div>
               <div className="text-left">
-                <p className="text-xs text-muted-foreground">التنبؤ بعد 5 دقائق</p>
+                <p className="text-xs text-muted-foreground">التنبؤ بعد {horizonLabel[horizon]}</p>
                 <p className={`font-mono text-2xl font-semibold ${tone(sig?.direction)}`}>{sig ? fmt(sig.forecast) : "—"}</p>
               </div>
             </div>
@@ -181,9 +224,9 @@ function Dashboard() {
 
           <div className="panel p-5">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-              <h2 className="font-semibold">اختبار رجعي (آخر 750 شمعة، شامل رسوم 0.1%)</h2>
+              <h2 className="font-semibold">اختبار رجعي 5 دقائق (آخر 750 شمعة، بعد رسوم {feePct}%)</h2>
               <div className="flex gap-2 text-xs">
-                {([["htfTrend", "تأكيد الفريم الأعلى"], ["volume", "فلتر الحجم"]] as const).map(([k, l]) => (
+                {([["htfTrend", "تأكيد الفريم الأعلى"], ["volume", "فلتر الحجم"], ["pressure", "ضغط الشراء/البيع"]] as const).map(([k, l]) => (
                   <button key={k} onClick={() => setFilters((f) => ({ ...f, [k]: !f[k] }))}
                     className={`rounded-md border px-3 py-1 ${filters[k] ? "border-primary text-primary" : "border-border text-muted-foreground"}`}>
                     {filters[k] ? "✓ " : ""}{l}
@@ -208,32 +251,40 @@ function Dashboard() {
             )}
           </div>
 
-          <div className="panel p-5">
-            <h2 className="mb-3 font-semibold">التداول الورقي</h2>
-            {trades.length === 0 ? <p className="text-sm text-muted-foreground">لا توجد صفقات بعد.</p> : (
-              <div className="overflow-x-auto">
-                <table className="w-full font-mono text-xs">
-                  <thead className="text-muted-foreground"><tr className="text-right">
-                    <th className="py-2">الاتجاه</th><th>الدخول</th><th>الوقف</th><th>الهدف</th><th>الكمية</th><th>الخروج</th><th>الربح</th><th></th>
-                  </tr></thead>
-                  <tbody>
-                    {trades.slice(0, 15).map((t) => (
-                      <tr key={t.id} className="border-t border-border">
-                        <td className={`py-2 ${tone(t.dir)}`}>{dirLabel[t.dir]}</td>
-                        <td>{fmt(t.entry)}</td><td>{fmt(t.stop)}</td><td>{fmt(t.target)}</td><td>{t.qty.toFixed(4)}</td>
-                        <td>{t.exit ? fmt(t.exit) : "مفتوحة"}</td>
-                        <td className={t.pnl === undefined ? "" : t.pnl >= 0 ? "text-bull" : "text-bear"}>{t.pnl === undefined ? "—" : fmt(t.pnl)}</td>
-                        <td>{t.exit === undefined && <button onClick={() => closeTrade(t.id)} disabled={stale} className="rounded border border-border px-2 py-0.5 text-xs hover:bg-secondary disabled:opacity-40">إغلاق</button>}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </div>
+          <HorizonLab data={{ "15m": h15.candles, "1h": h1.candles }} feePct={feePct} onFeeChange={setFeePct} />
+
+          <PaperLab trades={trades} stale={stale} onClose={closeTrade} onClear={clearClosed} />
         </section>
 
         <aside className="space-y-4">
+          <div className="panel p-4">
+            <p className="mb-2 text-xs text-muted-foreground">أفق الإشارة والصفقة الورقية</p>
+            <div className="grid grid-cols-3 gap-2">
+              {(["5m", "15m", "1h"] as const).map((x) => (
+                <button key={x} onClick={() => setHorizon(x)} className={`rounded-md border py-1.5 font-mono text-sm ${horizon === x ? "border-primary bg-primary text-primary-foreground" : "border-border text-muted-foreground hover:bg-secondary"}`}>{x}</button>
+              ))}
+            </div>
+          </div>
+
+          <div className="panel p-5">
+            <div className="mb-3 flex items-center justify-between">
+              <h2 className="font-semibold">ضغط الشراء والبيع</h2>
+              <button onClick={() => setFilters((f) => ({ ...f, pressure: !f.pressure }))}
+                className={`rounded-md border px-2 py-0.5 text-xs ${filters.pressure ? "border-primary text-primary" : "border-border text-muted-foreground"}`}>
+                المرشح: {filters.pressure ? "يعمل" : "متوقف"}
+              </button>
+            </div>
+            <Gauge label="دفتر الأوامر (±0.5%)" value={book.imbalance} />
+            <Gauge label="الشراء العدواني (آخر 3 شموع)" value={taker === null ? null : (taker - 0.5) * 2} />
+            <div className="mt-3 space-y-1 font-mono text-xs">
+              <Row k="طلبات شراء" v={`${fmt(book.bidQty, 1)} ETH`} />
+              <Row k="عروض بيع" v={`${fmt(book.askQty, 1)} ETH`} />
+            </div>
+            <p className={`mt-3 text-xs ${pressureOk === null ? "text-muted-foreground" : pressureOk ? "text-bull" : "text-bear"}`}>
+              {pressureOk === null ? "لا توجد إشارة اتجاه لمقارنتها." : pressureOk ? "الضغط يتوافق مع الإشارة الخام." : "الضغط يعاكس الإشارة الخام."}
+            </p>
+          </div>
+
           <div className={`panel p-5 ${sig?.direction === "LONG" ? "glow-bull" : sig?.direction === "SHORT" ? "glow-bear" : ""}`}>
             <p className="text-xs text-muted-foreground">الإشارة الحالية</p>
             <p className={`mt-1 text-4xl font-bold ${tone(sig?.direction)}`}>{sig ? dirLabel[sig.direction] : "—"}</p>
@@ -247,7 +298,7 @@ function Dashboard() {
           </div>
 
           <div className="panel p-5">
-            <h2 className="mb-3 font-semibold">إدارة المخاطرة 1%</h2>
+            <h2 className="mb-3 font-semibold">إدارة المخاطرة 1% · صفقة {horizonLabel[horizon]}</h2>
             <label className="text-xs text-muted-foreground">رأس المال (USDT)</label>
             <input type="number" value={Math.round(equity * 100) / 100} onChange={(e) => setEquity(+e.target.value || 0)}
               className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm" dir="ltr" />
@@ -290,4 +341,17 @@ function Stat({ k, v }: { k: string; v: string }) {
 }
 function Row({ k, v }: { k: string; v: string }) {
   return <div className="flex justify-between"><span className="font-sans text-muted-foreground">{k}</span><span dir="ltr">{v}</span></div>;
+}
+
+function Gauge({ label, value }: { label: string; value: number | null }) {
+  const pct = value === null ? 50 : Math.round(((value + 1) / 2) * 100);
+  return (
+    <div className="mb-3">
+      <div className="mb-1 flex justify-between text-xs"><span className="text-muted-foreground">{label}</span>
+        <span dir="ltr" className={`font-mono ${value === null ? "text-muted-foreground" : value > 0 ? "text-bull" : "text-bear"}`}>{value === null ? "—" : `${value > 0 ? "+" : ""}${(value * 100).toFixed(0)}%`}</span></div>
+      <div dir="ltr" className="relative h-2 overflow-hidden rounded-full bg-bear/40">
+        <div className="absolute inset-y-0 left-0 bg-bull" style={{ width: `${pct}%` }} />
+      </div>
+    </div>
+  );
 }

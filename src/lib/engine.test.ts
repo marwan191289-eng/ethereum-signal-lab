@@ -68,3 +68,39 @@ describe("filters", () => {
     if (a.trades) expect(b.pnlR).toBeLessThan(a.pnlR);
   });
 });
+
+import { takerBuyRatio, pressureAgrees, bookImbalance, walkForward, NO_FILTERS } from "./engine";
+describe("buy/sell pressure filter", () => {
+  const withTaker = (ratio: number) => Array.from({ length: 300 }, (_, i) => {
+    const p = 100 + i * 0.5; return { time: i * 300, open: p - 0.2, high: p + 0.5, low: p - 0.5, close: p, volume: 10, takerBuy: 10 * ratio };
+  });
+  it("measures taker-buy share over the last 3 candles", () => {
+    expect(takerBuyRatio(withTaker(0.6), 299)).toBeCloseTo(0.6);
+  });
+  it("keeps a long only when taker buys are at least 52%", () => {
+    expect(pressureAgrees("LONG", 0.52)).toBe(true);
+    expect(pressureAgrees("LONG", 0.51)).toBe(false);
+  });
+  it("keeps a short only when taker buys are at most 48%", () => {
+    expect(pressureAgrees("SHORT", 0.48)).toBe(true);
+    expect(pressureAgrees("SHORT", 0.5)).toBe(false);
+  });
+  it("live book must also lean at least 10% the same way", () => {
+    expect(pressureAgrees("LONG", 0.6, 0.05)).toBe(false);
+    expect(pressureAgrees("LONG", 0.6, 0.1)).toBe(true);
+  });
+  it("computes book imbalance within ±0.5% of mid", () => {
+    expect(bookImbalance([[100, 3], [90, 100]], [[100.1, 1]])).toBeCloseTo(0.5);
+  });
+  it("blocks a long when sellers dominate and the pressure filter is on", () => {
+    const c = withTaker(0.3);
+    const s = { ...computeSignal(c), direction: "LONG" as const };
+    expect(applyFilters(c, 299, s, { ...NO_FILTERS, pressure: true }).direction).toBe("NEUTRAL");
+    expect(applyFilters(c, 299, s, NO_FILTERS).direction).toBe("LONG");
+  });
+  it("splits 70% training / 30% independent period without overlap", () => {
+    const c = withTaker(0.5);
+    const w = walkForward(c, NO_FILTERS, 0.1, "15m");
+    expect(w.split).toBe(Math.floor(80 + (299 - 80) * 0.7));
+  });
+});

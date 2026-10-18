@@ -23,7 +23,7 @@ export function useMarketData() {
           if (!response.ok) throw new Error("Market unavailable");
           const rows: unknown = await response.json();
           if (!Array.isArray(rows) || rows.length < 51) throw new Error("Incomplete candles");
-          const next: Candle[] = rows.map((k) => ({ time: Number(k[0]) / 1000, open: Number(k[1]), high: Number(k[2]), low: Number(k[3]), close: Number(k[4]), volume: Number(k[5]) }));
+          const next: Candle[] = rows.map((k) => ({ time: Number(k[0]) / 1000, open: Number(k[1]), high: Number(k[2]), low: Number(k[3]), close: Number(k[4]), volume: Number(k[5]), takerBuy: Number(k[9]) }));
           if (next.some((c) => Object.values(c).some((v) => !Number.isFinite(v)) || c.close <= 0)) throw new Error("Invalid candles");
           if (!disposed) {
             setCandles((previous) => previous.length && previous[previous.length - 1].time > next[next.length - 1].time ? previous : next);
@@ -43,7 +43,7 @@ export function useMarketData() {
       socket.onmessage = (event) => {
         try {
           const k = JSON.parse(event.data).k;
-          const candle: Candle = { time: k.t / 1000, open: +k.o, high: +k.h, low: +k.l, close: +k.c, volume: +k.v };
+          const candle: Candle = { time: k.t / 1000, open: +k.o, high: +k.h, low: +k.l, close: +k.c, volume: +k.v, takerBuy: +k.V };
           if (Object.values(candle).some((v) => !Number.isFinite(v)) || candle.close <= 0) return;
           setCandles((prev) => {
             const last = prev[prev.length - 1];

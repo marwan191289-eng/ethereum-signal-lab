@@ -49,21 +49,21 @@ describe("filters", () => {
   it("blocks a signal when volume is not above 1.2x average", () => {
     const c = mk(300, () => 10);
     const s = { ...computeSignal(c), direction: "LONG" as const };
-    expect(applyFilters(c, 299, s, { htfTrend: false, volume: true }).direction).toBe("NEUTRAL");
+    expect(applyFilters(c, 299, s, { htfTrend: false, volume: true, pressure: false }).direction).toBe("NEUTRAL");
   });
   it("keeps a long when higher timeframe is up and volume spikes", () => {
     const c = mk(300, (i) => (i === 299 ? 50 : 10));
     const s = { ...computeSignal(c), direction: "LONG" as const };
-    expect(applyFilters(c, 299, s, { htfTrend: true, volume: true }).direction).toBe("LONG");
+    expect(applyFilters(c, 299, s, { htfTrend: true, volume: true, pressure: false }).direction).toBe("LONG");
   });
   it("blocks a short against an up higher-timeframe trend", () => {
     const c = mk(300, (i) => (i === 299 ? 50 : 10));
     const s = { ...computeSignal(c), direction: "SHORT" as const };
-    expect(applyFilters(c, 299, s, { htfTrend: true, volume: false }).direction).toBe("NEUTRAL");
+    expect(applyFilters(c, 299, s, { htfTrend: true, volume: false, pressure: false }).direction).toBe("NEUTRAL");
   });
   it("fees reduce backtest result", () => {
     const c = mk(300, () => 10);
-    const off = { htfTrend: false, volume: false };
+    const off = { htfTrend: false, volume: false, pressure: false };
     const a = backtestFiltered(c, off, 0), b = backtestFiltered(c, off, 0.1);
     if (a.trades) expect(b.pnlR).toBeLessThan(a.pnlR);
   });

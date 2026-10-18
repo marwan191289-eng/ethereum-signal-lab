@@ -11,7 +11,7 @@ export async function fetchKlines(interval: Horizon, pages = 2, signal?: AbortSi
       let all: Candle[] = [];
       for (let p = 0; p < pages; p++) {
         const url = `${endpoint}/api/v3/klines?symbol=ETHUSDT&interval=${interval}&limit=1000${end ? `&endTime=${end}` : ""}`;
-        const res = await fetch(url, { signal });
+        const res = await fetch(url, signal ? { signal } : {});
         if (!res.ok) throw new Error("Market unavailable");
         const rows: unknown = await res.json();
         if (!Array.isArray(rows) || !rows.length) break;

@@ -98,7 +98,7 @@ function Dashboard() {
     }
   }, [sig?.direction]);
 
-  const settle = (t: Trade, exit: number, outcome: Trade["outcome"]): Trade => {
+  const settle = (t: Trade, exit: number, outcome: NonNullable<Trade["outcome"]>): Trade => {
     const gross = (t.dir === "LONG" ? exit - t.entry : t.entry - exit) * t.qty;
     const fee = (t.entry * t.qty * (t.feePct ?? 0)) / 100;
     const risk = Math.abs(t.entry - t.stop) * t.qty;
